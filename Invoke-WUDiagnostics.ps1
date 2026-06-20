@@ -77,7 +77,7 @@
     - Read-only orchestration; no remediation is triggered.
     - The wrapper does not start its own transcript (to avoid nesting); each step's
       record lands in the shared run folder.
-    - Not yet executed in production. Run elevated and review the run folder.
+    - Production-tested on Windows Server 2025. Run elevated and review the run folder.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]

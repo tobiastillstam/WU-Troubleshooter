@@ -125,7 +125,7 @@
         FAIL - DNS failed for a non-wildcard host, or no path reached the endpoint.
     - Endpoint lists are CDN-backed and change over time. Wildcard endpoints are tested
       using representative hostnames; treat those DNS misses as warnings, not failures.
-    - Not yet executed in production. Run elevated and review the transcript log.
+    - Production-tested on Windows Server 2025. Run elevated and review the transcript log.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]

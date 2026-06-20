@@ -158,7 +158,7 @@
       (deep WU error/ETL analysis).
     - -ResetSoftwareDistribution renames rather than deletes, so it can be rolled back
       by restoring the .old folders.
-    - Not yet executed in production. Run elevated and review the transcript log.
+    - Production-tested on Windows Server 2025. Run elevated and review the transcript log.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
