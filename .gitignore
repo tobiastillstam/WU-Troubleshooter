@@ -1,0 +1,16 @@
+# Toolset output / transcripts
+logs/
+*.log
+WUDiag_*/
+
+# Converted WU log and exports
+WindowsUpdate.log
+*.csv
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+*.tmp
+*~
