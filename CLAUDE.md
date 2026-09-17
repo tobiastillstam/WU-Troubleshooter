@@ -6,7 +6,7 @@ Global conventions (PowerShell template, working style) live in
 Target:  Windows Server 2025, Windows Update client-side (online and/or WSUS-managed).
          WSUS *server*-side diagnostics (SUSDB, content store) are a separate, later task -
          out of scope here.
-Status:  v1.1.0, production-tested. Prepping GitHub release files (README / CHANGELOG / LICENSE / .gitignore).
+Status:  v1.1.0, production-tested, released (tagged v1.0.0 and v1.1.0 on GitHub).
 Package: WU-Troubleshooting-Toolset.zip
 
 ## Scripts
