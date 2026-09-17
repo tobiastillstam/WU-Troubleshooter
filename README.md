@@ -3,10 +3,14 @@
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
 ![Platform](https://img.shields.io/badge/Windows%20Server-2025-0078D6)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 
-A PowerShell toolset for troubleshooting **online Windows Update** (not on-prem WSUS) on
-**Windows Server 2025**. It works the problem in the order that actually isolates it:
+A PowerShell toolset for troubleshooting Windows Update on **Windows Server 2025** -
+whether the machine gets updates from **online Windows Update** or is **WSUS-managed**.
+Update source is auto-detected from the WSUS/Defender policy registry keys, so a
+WSUS-managed box reports a clean result instead of false-positive connectivity failures.
+WSUS *server*-side diagnostics (SUSDB, content store state) are out of scope. The toolset
+works the problem in the order that actually isolates it:
 
 > **wire → client → errors → repair**
 
@@ -24,10 +28,10 @@ subfolder, and structured pipeline output alongside a readable console report.
 
 | Script | Purpose |
 | --- | --- |
-| `Test-WUOnlineConnectivity.ps1` | The **wire** - DNS, TCP, TLS (1.2 + cert-issuer inspection), and proxy-aware HTTP checks against the documented WU / Microsoft Update / Delivery Optimization / diagnostics endpoints, over both the direct and configured-proxy paths. |
-| `Test-WULocalClient.ps1` | The **client** - services, SYSTEM-context proxy, update source/policy, reboot/disk/TLS/time blockers, BITS, datastore, history, events; optional live COM scan; opt-in repairs. |
-| `Get-WUErrors.ps1` | The **errors** - converts the modern WU ETL logs and surfaces HRESULT-coded failures, with benign-noise filtering, a per-code summary, known-issue hints, an update timeline mode, and a CBS component-store corruption scan. |
-| `Invoke-WUDiagnostics.ps1` | The **orchestrator** - runs all three into one timestamped run folder with a combined summary. |
+| `Test-WUOnlineConnectivity.ps1` | The **wire** - DNS, TCP, TLS (1.2 + cert-issuer inspection), and proxy-aware HTTP checks against the documented WU / Microsoft Update / Delivery Optimization / diagnostics endpoints, over both the direct and configured-proxy paths. When WSUS-managed, unreachable Microsoft endpoints report INFO instead of FAIL/WARN (unless Defender falls back to Microsoft Update), and a `-Category Wsus` check verifies the configured WSUS server (DNS/TCP/TLS-chain + ClientWebService). |
+| `Test-WULocalClient.ps1` | The **client** - services, SYSTEM-context proxy, update source/policy, reboot/disk/TLS/time blockers, BITS, datastore, history, events; optional live COM scan; opt-in repairs. WSUS management is treated as a valid configuration, not a defect. |
+| `Get-WUErrors.ps1` | The **errors** - converts the modern WU ETL logs and surfaces HRESULT-coded failures, with benign-noise filtering, a per-code summary, known-issue hints (WSUS-aware for a handful of codes), an update timeline mode, and a CBS component-store corruption scan. |
+| `Invoke-WUDiagnostics.ps1` | The **orchestrator** - runs all three into one timestamped run folder with a combined summary, resolving and forwarding `-UpdateSource` to each. |
 
 ---
 
@@ -84,8 +88,9 @@ you can capture (`$r = .\Test-WULocalClient.ps1`).
 ### Test-WUOnlineConnectivity.ps1
 
 ```powershell
-.\Test-WUOnlineConnectivity.ps1 [-Category Core|DeliveryOptimization|MicrosoftUpdate|Diagnostics|All]
-                                [-TimeoutSeconds 5] [-SkipProxyPath] [-FlushDnsFirst]
+.\Test-WUOnlineConnectivity.ps1 [-Category Core|DeliveryOptimization|MicrosoftUpdate|Diagnostics|Wsus|All]
+                                [-UpdateSource Auto|Online|WSUS] [-TimeoutSeconds 5]
+                                [-SkipProxyPath] [-FlushDnsFirst]
                                 [-ListEndpoints] [-CsvPath <file>] [-LogPath <file>]
 ```
 
@@ -95,11 +100,17 @@ a **non-Microsoft issuer** is flagged as likely SSL inspection, which breaks WU'
 certificate pinning. `-FlushDnsFirst` is the only state-changing action and is
 `ShouldProcess`-gated.
 
+`-Category Wsus` (included in `All` when the machine is WSUS-managed) tests the configured
+WSUS server instead: DNS, TCP, a TLS **chain** validation (not issuer-pinned - an internal
+CA or self-signed cert is expected and fine), and a `ClientWebService/client.asmx` probe
+that confirms the WSUS service itself responds, not just that the port is open.
+
 ### Test-WULocalClient.ps1
 
 ```powershell
 # diagnostics (read-only)
 .\Test-WULocalClient.ps1 [-Category System|Services|Proxy|Source|Blockers|Bits|Datastore|History|Events|All]
+                         [-UpdateSource Auto|Online|WSUS]
                          [-RunLiveScan] [-EventDays 7] [-EventCount 10] [-MinFreeGB 10]
                          [-CsvPath <file>] [-LogPath <file>]
 
@@ -118,7 +129,8 @@ any of it with `-WhatIf`.
 
 ```powershell
 # coded errors in the last N hours (benign noise filtered, grouped by HRESULT)
-.\Get-WUErrors.ps1 [-HoursBack 24] [-IncludeText] [-IncludeBenign] [-PassThru] [-CsvPath <file>]
+.\Get-WUErrors.ps1 [-HoursBack 24] [-UpdateSource Auto|Online|WSUS]
+                   [-IncludeText] [-IncludeBenign] [-PassThru] [-CsvPath <file>]
 
 # full timeline for one update (download -> install -> failure)
 .\Get-WUErrors.ps1 -UpdateId 4345BE8F -HoursBack 168
@@ -131,6 +143,7 @@ any of it with `-WhatIf`.
 
 ```powershell
 .\Invoke-WUDiagnostics.ps1 [-Include Connectivity,LocalClient,Errors|All]
+                           [-UpdateSource Auto|Online|WSUS]
                            [-RunLiveScan] [-PerStepCsv]
                            [-ScriptFolder <dir>] [-ReportFolder <dir>]
 ```
@@ -138,12 +151,17 @@ any of it with `-WhatIf`.
 Runs the three tools in order into `logs\WUDiag_<timestamp>\` and writes
 `Combined-Summary.txt`. It forwards parameters adaptively (only what each script supports)
 and is **read-only** - it never triggers the local-client remediation switches.
+`-UpdateSource` (default `Auto`, registry-detected) is resolved once and forwarded to
+every step, so a locked-down WSUS box reports a clean result end to end.
 
 ---
 
 ## Reading the output
 
-Checks report `PASS` / `WARN` / `FAIL` / `INFO`. `Get-WUErrors` groups failures by HRESULT
+Checks report `PASS` / `WARN` / `FAIL` / `INFO`. `INFO` never affects the combined
+PASS/WARN/FAIL roll-up - it's how WSUS-expected results are shown without being false
+positives: an unreachable Microsoft endpoint on a WSUS-managed box, for example.
+`Get-WUErrors` groups failures by HRESULT
 and annotates known ones, for example:
 
 ```

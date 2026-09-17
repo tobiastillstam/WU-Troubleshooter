@@ -3,15 +3,16 @@
 
 <#
 .SYNOPSIS
-    Tests all network communication required for Windows Update ONLINE services
-    (not on-prem WSUS) on Windows Server 2025.
+    Tests network communication required for Windows Update - online Microsoft
+    endpoints and/or a WSUS-managed environment - on Windows Server 2025.
 
 .DESCRIPTION
     Diagnostic, read-only connectivity tester for the Microsoft-documented set of
-    Windows Update / Microsoft Update / Delivery Optimization / diagnostics endpoints.
+    Windows Update / Microsoft Update / Delivery Optimization / diagnostics endpoints,
+    plus (when the machine is WSUS-managed) the configured WSUS server itself.
 
-    For every endpoint the script can perform, depending on the endpoint's documented
-    protocol:
+    For every online endpoint the script can perform, depending on the endpoint's
+    documented protocol:
 
       1. DNS resolution            (Resolve-DnsName, falling back to System.Net.Dns)
       2. Direct TCP reachability   (raw TcpClient - bypasses any proxy)
@@ -27,6 +28,16 @@
     tested over HTTPS and vice versa - mixing them causes failures. Each endpoint is
     therefore tested ONLY on its documented protocol/port.
 
+    WSUS awareness: the script reads the WSUS/Defender policy keys to determine whether
+    this machine is WSUS-managed for OS updates (independent of Defender's own signature
+    update source). When WSUS-managed and Defender is not falling back to Microsoft
+    Update, an unreachable Microsoft endpoint is expected - those results are reported as
+    INFO instead of FAIL/WARN (the endpoint is still probed; only the severity changes).
+    When WSUS-managed, a -Category Wsus check additionally verifies DNS/TCP/TLS-chain
+    reachability of the configured WSUS server and that its ClientWebService responds.
+    WSUS *server*-side diagnostics (SUSDB, content store) are out of scope - see
+    -UpdateSource below.
+
     The script changes nothing on the system. The single exception is the optional
     -FlushDnsFirst switch (Clear-DnsClientCache), which is the only action gated behind
     ShouldProcess.
@@ -39,7 +50,15 @@
       DeliveryOptimization - DO service and content (P2P/CDN) endpoints
       MicrosoftUpdate      - Microsoft Update catalog, licensing/activation, CRL
       Diagnostics          - Settings, telemetry and error-reporting endpoints
+      Wsus                 - the configured WSUS server (only tested when WSUS-managed)
       All                  - every group (default)
+
+.PARAMETER UpdateSource
+    How to interpret this machine's update source. Auto (default) detects it from the
+    WSUS/Defender policy registry keys. Online or WSUS forces the interpretation
+    regardless of what the registry says - useful when testing the reframing itself, or
+    when policy is applied at a level this script cannot see. Read-only; not
+    ShouldProcess-gated.
 
 .PARAMETER TimeoutSeconds
     Per-operation timeout in seconds for DNS, TCP, TLS and HTTP tests. Default 5.
@@ -88,16 +107,33 @@
     .\Test-WUOnlineConnectivity.ps1 -ListEndpoints
     Prints the endpoint/protocol/port table without testing anything.
 
+.EXAMPLE
+    .\Test-WUOnlineConnectivity.ps1 -Category Wsus -Verbose
+    Tests only the configured WSUS server (DNS, TCP, TLS chain, ClientWebService).
+    No-ops with an INFO row if the machine is not WSUS-managed.
+
+.EXAMPLE
+    .\Test-WUOnlineConnectivity.ps1 -UpdateSource WSUS
+    Forces WSUS interpretation: unreachable Microsoft endpoints report INFO instead of
+    FAIL/WARN (unless Defender is configured to fall back to Microsoft Update).
+
 .NOTES
     Author        : Tobias Tillstam, Tillnet
     Webpage       : https://tillnet.se
     GitHub        : https://github.com/tobiastillstam
-    Version       : 1.0.0
+    Version       : 1.1.0
     Date Created  : 2026-06-17
-    Last Modified : 2026-06-20
+    Last Modified : 2026-08-19
 
     Change Log
     ----------
+    1.1.0 (2026-08-19) - Added WSUS awareness: reads the WSUS/Defender policy keys via
+                         the shared Get-WUUpdateSourceInfo detection block, downgrades
+                         unreachable Microsoft endpoints to INFO when WSUS-managed and
+                         Defender is not falling back to Microsoft Update, and adds a
+                         -Category Wsus check (DNS/TCP/TLS-chain to the configured WSUS
+                         server, plus a ClientWebService probe). New -UpdateSource
+                         Auto|Online|WSUS parameter (default Auto).
     1.0.0 (2026-06-20) - First public release under the MIT license.
     0.4.0 (2026-06-18) - HTTP path now uses a raw HttpWebRequest instead of Invoke-WebRequest,
                          so expected 4xx responses no longer echo as terminating-error lines
@@ -115,7 +151,8 @@
 
     Operational notes:
     - Target: Windows Server 2025 (Windows PowerShell 5.1; also runs on PowerShell 7+).
-    - Scope: ONLINE Windows Update communication only. On-prem WSUS is out of scope.
+    - Scope: client-side connectivity, online and WSUS. WSUS *server*-side diagnostics
+      (SUSDB, content store state) are out of scope.
     - Read-only. The only state-changing action is the optional -FlushDnsFirst.
     - Result interpretation:
         PASS - at least one valid path reached the endpoint as expected.
@@ -132,8 +169,14 @@
 param(
     # Endpoint group(s) to test.
     [Parameter(Mandatory = $false)]
-    [ValidateSet('Core', 'DeliveryOptimization', 'MicrosoftUpdate', 'Diagnostics', 'All')]
+    [ValidateSet('Core', 'DeliveryOptimization', 'MicrosoftUpdate', 'Diagnostics', 'Wsus', 'All')]
     [string[]]$Category = 'All',
+
+    # How to interpret the update source: Auto detects from the registry, or force
+    # Online/WSUS regardless of what the registry says.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Auto', 'Online', 'WSUS')]
+    [string]$UpdateSource = 'Auto',
 
     # Per-operation timeout in seconds.
     [Parameter(Mandatory = $false)]
@@ -214,6 +257,97 @@ $OptionalHosts = @(
 # -------------------------------------------------------------------------
 # Helper functions
 # -------------------------------------------------------------------------
+
+# --- Canonical update-source detection (keep identical across all four scripts) ---
+# Determines whether this machine is managed by WSUS for OS updates and, independently,
+# what source Windows Defender uses for signature updates. Self-contained: does not call
+# any other helper in this script, so it can be copy-pasted verbatim into any of the four
+# WU-Troubleshooter scripts.
+function Get-WUUpdateSourceInfo {
+    [CmdletBinding()]
+    param(
+        # Manual override; default Auto resolves from the registry.
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Auto', 'Online', 'WSUS')]
+        [string]$Override = 'Auto'
+    )
+
+    $wuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    $defenderPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Signature Updates'
+
+    # UseWUServer is documented under \AU; fall back to the parent key since misplaced
+    # values do occur in the field.
+    $useWUServer = (Get-ItemProperty -Path $auPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    if ($null -eq $useWUServer) {
+        $useWUServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    }
+    $wuServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUServer' -ErrorAction SilentlyContinue).WUServer
+    $wuStatusServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUStatusServer' -ErrorAction SilentlyContinue).WUStatusServer
+
+    $wsusManaged = ($useWUServer -eq 1)
+
+    # Parse the WSUS URL, defaulting the port from the scheme when the URL omits it.
+    $wuServerScheme = $null
+    $wuServerHost   = $null
+    $wuServerPort   = $null
+    $wuServerValid  = $false
+    if ($wuServer) {
+        try {
+            $uri = [Uri]$wuServer
+            $wuServerScheme = $uri.Scheme
+            $wuServerHost   = $uri.Host
+            $wuServerPort   = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq 'https') { 443 } else { 80 }
+            $wuServerValid  = [bool]$wuServerHost
+        }
+        catch {
+            $wuServerValid = $false
+        }
+    }
+
+    # Defender's signature-update source is independent of the OS-update source above -
+    # a box can be WSUS-managed for OS updates but still fall back to MicrosoftUpdateServer
+    # for Defender definitions.
+    $fallbackRaw   = (Get-ItemProperty -Path $defenderPath -Name 'FallbackOrder' -ErrorAction SilentlyContinue).FallbackOrder
+    $fileSharesRaw = (Get-ItemProperty -Path $defenderPath -Name 'DefinitionUpdateFileSharesSources' -ErrorAction SilentlyContinue).DefinitionUpdateFileSharesSources
+    $defenderFallbackOrder = @()
+    if ($fallbackRaw) { $defenderFallbackOrder = @($fallbackRaw -split '\|' | Where-Object { $_ }) }
+    $defenderFileShares = @()
+    if ($fileSharesRaw) { $defenderFileShares = @($fileSharesRaw -split '\|' | Where-Object { $_ }) }
+    $defenderUsesMicrosoftUpdate = [bool]($defenderFallbackOrder | Where-Object { $_ -in 'MicrosoftUpdateServer', 'MMPC' })
+
+    # Resolve the effective source: an explicit override always wins over the registry.
+    $source = 'Registry'
+    if ($Override -eq 'Online') {
+        $resolvedSource = 'Online'; $source = 'Override'
+    }
+    elseif ($Override -eq 'WSUS') {
+        $resolvedSource = 'WSUS'; $source = 'Override'
+    }
+    else {
+        $resolvedSource = if ($wsusManaged) { 'WSUS' } else { 'Online' }
+    }
+
+    [pscustomobject]@{
+        UpdateSource                = $resolvedSource
+        Source                      = $source
+        WsusManaged                 = $wsusManaged
+        WUServer                    = $wuServer
+        WUStatusServer              = $wuStatusServer
+        WUServerScheme              = $wuServerScheme
+        WUServerHost                = $wuServerHost
+        WUServerPort                = $wuServerPort
+        WUServerValid               = $wuServerValid
+        DefenderFallbackOrder       = $defenderFallbackOrder
+        DefenderFileShares          = $defenderFileShares
+        DefenderUsesMicrosoftUpdate = $defenderUsesMicrosoftUpdate
+        Summary                     = ('UpdateSource={0} ({1}) | WSUS={2}{3} | DefenderUsesMU={4}' -f `
+                $resolvedSource, $source, $wsusManaged, `
+                $(if ($wsusManaged -and $wuServer) { " ($wuServer)" } else { '' }), `
+                $defenderUsesMicrosoftUpdate)
+    }
+}
+# --- End canonical update-source detection ---
 
 function Get-ProxyConfiguration {
     <#
@@ -379,13 +513,14 @@ function Test-HttpPath {
     param(
         [Parameter(Mandatory)][string]$Url,
         [Parameter()][System.Net.WebProxy]$Proxy,
-        [Parameter(Mandatory)][int]$TimeoutSec
+        [Parameter(Mandatory)][int]$TimeoutSec,
+        [Parameter()][string]$Method = 'HEAD'
     )
 
     $r = [pscustomobject]@{ Ok = $false; StatusCode = $null; UsedProxy = [bool]$Proxy; Error = $null }
     try {
         $req = [System.Net.HttpWebRequest]::Create($Url)
-        $req.Method            = 'HEAD'
+        $req.Method            = $Method
         $req.Timeout           = $TimeoutSec * 1000
         $req.AllowAutoRedirect = $true
         # Honor the configured proxy; otherwise force direct (empty proxy) rather than
@@ -416,6 +551,168 @@ function Test-HttpPath {
     return $r
 }
 
+function Test-WsusEndpoint {
+    <#
+        Tests reachability of the configured WSUS server: DNS + TCP to the WUServer
+        host:port, a TLS chain validation for HTTPS (unlike Test-DirectConnection above,
+        this checks whether the chain is actually TRUSTED rather than who issued it - a
+        WSUS server legitimately presents an internal-CA or self-signed certificate, so
+        flagging a non-Microsoft issuer here would be a false positive), and an HTTP probe
+        of ClientWebService/client.asmx to confirm the WSUS service itself responds rather
+        than just the port being open. Forced direct (no proxy) - WSUS is internal and
+        normally on the proxy bypass list. Returns rows on the same schema as the main
+        endpoint loop so CSV export and orchestrator counting keep working.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$SourceInfo,
+        [Parameter(Mandatory)][int]$TimeoutMs,
+        [Parameter(Mandatory)][int]$TimeoutSec
+    )
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    $blankRow = @{
+        Category = 'Wsus'; Protocol = '-'; Port = $null; Wildcard = $false
+        DnsResolved = $null; IPs = $null; TcpDirect = $null; LatencyMs = $null
+        TlsDirect = $null; TlsProtocol = $null; CertIssuer = $null; IssuerIsMS = $null
+        HttpProxyOk = $null; HttpStatus = $null
+    }
+
+    if (-not $SourceInfo.WsusManaged) {
+        $rows.Add([pscustomobject](
+                $blankRow + @{ Endpoint = '(none)'; Result = 'INFO'; Note = 'WSUS check'
+                    Detail = 'Not WSUS-managed (UseWUServer != 1); skipping WSUS reachability checks' }))
+        return $rows
+    }
+
+    if (-not $SourceInfo.WUServerValid) {
+        $rows.Add([pscustomobject](
+                $blankRow + @{ Endpoint = '(unparseable)'; Result = 'FAIL'; Note = 'WSUS check'
+                    Detail = ('UseWUServer=1 but WUServer is missing or unparseable ({0})' -f $SourceInfo.WUServer) }))
+        return $rows
+    }
+
+    $hostName = $SourceInfo.WUServerHost
+    $port     = $SourceInfo.WUServerPort
+    $scheme   = $SourceInfo.WUServerScheme
+    $isHttps  = ($scheme -eq 'https')
+
+    # --- DNS ---
+    $ips   = Resolve-EndpointDns -HostName $hostName
+    $dnsOk = [bool]$ips
+    if (-not $dnsOk) {
+        $rows.Add([pscustomobject](
+                $blankRow + @{ Endpoint = $hostName; Protocol = $scheme; Port = $port; DnsResolved = $false
+                    Result = 'FAIL'; Note = 'WSUS server'; Detail = 'DNS resolution FAILED for the configured WUServer host' }))
+        return $rows
+    }
+
+    # --- TCP (+ TLS chain validation for HTTPS) ---
+    $tcpOk = $false; $latency = $null; $tlsOk = $null; $tlsProtocol = $null
+    $certIssuer = $null; $chainValid = $null; $chainStatus = $null
+    $client = $null; $sslStream = $null
+    $chainCapture = @{ Errors = $null; Chain = $null }
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $sw     = [System.Diagnostics.Stopwatch]::StartNew()
+        $async  = $client.BeginConnect($hostName, $port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            throw "TCP connect timed out after $TimeoutMs ms"
+        }
+        $client.EndConnect($async)
+        $sw.Stop()
+        $tcpOk   = $client.Connected
+        $latency = [math]::Round($sw.Elapsed.TotalMilliseconds, 0)
+
+        if ($isHttps -and $tcpOk) {
+            $client.ReceiveTimeout = $TimeoutMs
+            $client.SendTimeout    = $TimeoutMs
+            $netStream = $client.GetStream()
+            # Captures the real chain-validation result (SslPolicyErrors) instead of
+            # blanket-accepting the cert - the point of this check is trust, not issuer.
+            $callback = [System.Net.Security.RemoteCertificateValidationCallback] {
+                param($s, $cert, $chain, $errors)
+                $chainCapture.Errors = $errors
+                $chainCapture.Chain  = $chain
+                $true
+            }
+            $sslStream = New-Object System.Net.Security.SslStream($netStream, $false, $callback)
+            $sslStream.AuthenticateAsClient($hostName, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+
+            $tlsOk       = $true
+            $tlsProtocol = $sslStream.SslProtocol.ToString()
+            if ($sslStream.RemoteCertificate) {
+                $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 ($sslStream.RemoteCertificate)
+                $certIssuer = $x509.Issuer
+                $chainValid = ($chainCapture.Errors -eq [System.Net.Security.SslPolicyErrors]::None)
+                if ($chainCapture.Chain) {
+                    $badElements = @($chainCapture.Chain.ChainStatus | Where-Object { $_.Status -ne 'NoError' })
+                    $chainStatus = if ($badElements) { ($badElements | ForEach-Object { $_.StatusInformation.Trim() }) -join '; ' } else { 'NoError' }
+                }
+            }
+        }
+    }
+    catch {
+        if (-not $tcpOk) {
+            $rows.Add([pscustomobject](
+                    $blankRow + @{ Endpoint = $hostName; Protocol = $scheme; Port = $port; DnsResolved = $true
+                        IPs = ($ips -join ','); TcpDirect = $false; Result = 'FAIL'; Note = 'WSUS server'
+                        Detail = ('TCP connect failed: {0}' -f $_.Exception.Message) }))
+            return $rows
+        }
+        $tlsOk = $false
+    }
+    finally {
+        if ($sslStream) { $sslStream.Dispose() }
+        if ($client) { $client.Close() }
+    }
+
+    $tcpDetail = ('DNS ok ({0}) | TCP ok {1}ms' -f ($ips -join ','), $latency)
+    $tcpResult = 'PASS'
+    if ($isHttps) {
+        if ($tlsOk -and $chainValid) {
+            $tcpDetail += (' | TLS ok [{0}] chain valid | issuer={1}' -f $tlsProtocol, $certIssuer)
+        }
+        elseif ($tlsOk -and -not $chainValid) {
+            $tcpResult  = 'FAIL'
+            $tcpDetail += (' | TLS ok but chain INVALID: {0} | issuer={1}' -f $chainStatus, $certIssuer)
+        }
+        else {
+            $tcpResult  = 'FAIL'
+            $tcpDetail += ' | TLS handshake FAILED'
+        }
+    }
+    $rows.Add([pscustomobject](
+            $blankRow + @{ Endpoint = $hostName; Protocol = $scheme; Port = $port; DnsResolved = $true
+                IPs = ($ips -join ','); TcpDirect = $tcpOk; LatencyMs = $latency; TlsDirect = $tlsOk
+                TlsProtocol = $tlsProtocol; CertIssuer = $certIssuer; Result = $tcpResult
+                Note = 'WSUS server (DNS/TCP/TLS)'; Detail = $tcpDetail }))
+
+    # --- ClientWebService probe (direct, no proxy) ---
+    $cwsUrl = ('{0}://{1}:{2}/ClientWebService/client.asmx' -f $scheme, $hostName, $port)
+    $cws    = Test-HttpPath -Url $cwsUrl -TimeoutSec $TimeoutSec -Method 'GET'
+
+    $cwsResult = 'FAIL'
+    if ($cws.Ok) {
+        switch ($cws.StatusCode) {
+            200     { $cwsResult = 'PASS'; $cwsDetail = 'ClientWebService responded 200 (WSUS service is up)' }
+            401     { $cwsResult = 'WARN'; $cwsDetail = 'ClientWebService responded 401 (service alive, auth required)' }
+            default { $cwsResult = 'FAIL'; $cwsDetail = ('ClientWebService responded HTTP {0}' -f $cws.StatusCode) }
+        }
+    }
+    else {
+        $cwsDetail = ('ClientWebService unreachable: {0}' -f $cws.Error)
+    }
+
+    $rows.Add([pscustomobject](
+            $blankRow + @{ Endpoint = $hostName; Protocol = $scheme; Port = $port; DnsResolved = $true
+                IPs = ($ips -join ','); TcpDirect = $tcpOk; TlsDirect = $tlsOk; TlsProtocol = $tlsProtocol
+                CertIssuer = $certIssuer; HttpProxyOk = $cws.Ok; HttpStatus = $cws.StatusCode
+                Result = $cwsResult; Note = 'WSUS ClientWebService'; Detail = $cwsDetail }))
+
+    return $rows
+}
+
 function Write-ResultLine {
     [CmdletBinding()]
     param([Parameter(Mandatory)][pscustomobject]$Result)
@@ -424,6 +721,7 @@ function Write-ResultLine {
         'PASS'  { $color = 'Green' }
         'WARN'  { $color = 'Yellow' }
         'FAIL'  { $color = 'Red' }
+        'INFO'  { $color = 'Gray' }
         default { $color = 'Gray' }
     }
     $line = ('  [{0}] {1,-44} {2}/{3,-5} {4}' -f `
@@ -470,11 +768,15 @@ try {
         Write-Verbose "Could not adjust ServicePointManager.SecurityProtocol."
     }
 
+    # --- Update source detection (WSUS vs online, Auto or overridden) ------
+    $sourceInfo = Get-WUUpdateSourceInfo -Override $UpdateSource
+
     Write-Host ''
-    Write-Host '=== Windows Update ONLINE connectivity test ===' -ForegroundColor Cyan
+    Write-Host '=== Windows Update connectivity test ===' -ForegroundColor Cyan
     Write-Host ("Host: {0}    Date: {1}" -f $env:COMPUTERNAME, (Get-Date)) -ForegroundColor Cyan
     Write-Host ("Categories: {0}    Timeout: {1}s    Proxy path: {2}" -f `
         ($Category -join ','), $TimeoutSeconds, (-not $SkipProxyPath)) -ForegroundColor Cyan
+    Write-Host ("Update source: {0}" -f $sourceInfo.Summary) -ForegroundColor Cyan
 
     # --- Optional DNS cache flush (only state-changing action) --------------
     if ($FlushDnsFirst) {
@@ -615,6 +917,22 @@ try {
                 }
             }
 
+            # WSUS-mode reframing: an unreachable Microsoft endpoint is expected when this
+            # machine is WSUS-managed and Defender is not falling back to Microsoft Update -
+            # downgrade to INFO instead of a false-positive FAIL/WARN. The endpoint is still
+            # probed either way, so the DNS/TCP/TLS detail above is preserved regardless of
+            # severity. When Defender DOES fall back to MU, the endpoint should be reachable,
+            # so severity is left alone.
+            if ($sourceInfo.UpdateSource -eq 'WSUS' -and $verdict -in 'FAIL', 'WARN') {
+                if (-not $sourceInfo.DefenderUsesMicrosoftUpdate) {
+                    $detailParts.Add(('expected: WSUS-managed, Defender not using MU (was {0})' -f $verdict))
+                    $verdict = 'INFO'
+                }
+                else {
+                    $detailParts.Add('WSUS-managed but Defender uses Microsoft Update for definitions - this endpoint should be reachable')
+                }
+            }
+
             $row = [pscustomobject]@{
                 Category    = $ep.Category
                 Endpoint    = $ep.HostName
@@ -641,13 +959,25 @@ try {
         }
     }
 
+    # --- WSUS server reachability (only meaningful when WSUS-managed) -------
+    if (($Category -contains 'All') -or ($Category -contains 'Wsus')) {
+        Write-Host ''
+        Write-Host '--- Wsus ---' -ForegroundColor Cyan
+        $wsusRows = Test-WsusEndpoint -SourceInfo $sourceInfo -TimeoutMs $TimeoutMs -TimeoutSec $TimeoutSeconds
+        foreach ($row in $wsusRows) {
+            $results.Add($row)
+            Write-ResultLine -Result $row
+        }
+    }
+
     # --- Summary ------------------------------------------------------------
     Write-Host ''
     Write-Host '=== Summary ===' -ForegroundColor Cyan
     $pass = ($results | Where-Object Result -eq 'PASS').Count
     $warn = ($results | Where-Object Result -eq 'WARN').Count
     $fail = ($results | Where-Object Result -eq 'FAIL').Count
-    Write-Host ("PASS: {0}   WARN: {1}   FAIL: {2}   (of {3} endpoints)" -f $pass, $warn, $fail, $results.Count) `
+    $info = ($results | Where-Object Result -eq 'INFO').Count
+    Write-Host ("PASS: {0}   WARN: {1}   FAIL: {2}   INFO: {3}   (of {4} endpoints)" -f $pass, $warn, $fail, $info, $results.Count) `
         -ForegroundColor $(if ($fail) { 'Red' } elseif ($warn) { 'Yellow' } else { 'Green' })
 
     if ($results | Where-Object { $_.IssuerIsMS -eq $false }) {

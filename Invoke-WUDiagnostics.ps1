@@ -10,16 +10,17 @@
     Runs the three WU troubleshooting scripts in the logical order, collecting each
     one's output into a shared, timestamped run folder:
 
-      1. Connectivity - Test-WUOnlineConnectivity.ps1 (the network path to Microsoft)
+      1. Connectivity - Test-WUOnlineConnectivity.ps1 (the network path - Microsoft and/or WSUS)
       2. LocalClient  - Test-WULocalClient.ps1         (the local update client)
       3. Errors       - Get-WUErrors.ps1               (WU error/ETL detail)
 
     The wrapper is adaptive: for each script it inspects the parameters that script
     actually declares and only forwards the ones it supports. This means it works
     whether Get-WUErrors.ps1 is still the lightweight version (no parameters) or has
-    been brought up to the full template (with -LogPath etc.). Scripts that expose
-    -LogPath get their transcript pointed into the shared run folder; scripts that do
-    not are captured to a per-step log via Tee instead.
+    been brought up to the full template (with -LogPath etc.), and it is also what lets
+    -UpdateSource forward safely to an older copy of a sub-script that predates it.
+    Scripts that expose -LogPath get their transcript pointed into the shared run folder;
+    scripts that do not are captured to a per-step log via Tee instead.
 
     The wrapper itself is read-only. It does not invoke any of the remediation switches
     on Test-WULocalClient.ps1 - run those directly and deliberately when needed.
@@ -37,6 +38,14 @@
 .PARAMETER ReportFolder
     Base folder for run output. A timestamped subfolder (WUDiag_<timestamp>) is created
     inside it for this run. Defaults to a 'logs' subfolder beside this wrapper.
+
+.PARAMETER UpdateSource
+    How to interpret this machine's update source. Auto (default) detects it from the
+    WSUS/Defender policy registry keys. Online or WSUS forces the interpretation
+    regardless of what the registry says. The resolved value (never Auto) is forwarded to
+    each step that supports -UpdateSource, using the same adaptive forwarding as every
+    other parameter - so this also works against an older copy of a sub-script that
+    predates the parameter. Read-only; not ShouldProcess-gated.
 
 .PARAMETER RunLiveScan
     Forwarded to Test-WULocalClient.ps1 (if it supports it) to perform a live online
@@ -58,16 +67,28 @@
     .\Invoke-WUDiagnostics.ps1 -PerStepCsv -ReportFolder 'D:\WU-Reports'
     Runs everything and writes per-step CSVs under D:\WU-Reports\WUDiag_<timestamp>.
 
+.EXAMPLE
+    .\Invoke-WUDiagnostics.ps1 -UpdateSource WSUS
+    Forces WSUS interpretation and forwards it to every step that supports -UpdateSource,
+    so a locked-down WSUS box reports a clean PASS instead of false-positive connectivity
+    failures.
+
 .NOTES
     Author        : Tobias Tillstam, Tillnet
     Webpage       : https://tillnet.se
     GitHub        : https://github.com/tobiastillstam
-    Version       : 1.0.0
+    Version       : 1.1.0
     Date Created  : 2026-06-17
-    Last Modified : 2026-06-20
+    Last Modified : 2026-08-19
 
     Change Log
     ----------
+    1.1.0 (2026-08-19) - Added -UpdateSource Auto|Online|WSUS (default Auto), resolved via
+                         the shared Get-WUUpdateSourceInfo detection block and forwarded
+                         (as a resolved Online/WSUS value, never Auto) to each step that
+                         declares the parameter, using the existing adaptive forwarding.
+                         The resolved source is printed in the run header and recorded in
+                         Combined-Summary.txt.
     1.0.0 (2026-06-20) - First public release under the MIT license.
     0.1.0 (2026-06-17) - Initial release.
 
@@ -94,6 +115,13 @@ param(
     # Base output folder; a timestamped run subfolder is created inside it.
     [Parameter(Mandatory = $false)]
     [string]$ReportFolder = $(if ($PSScriptRoot) { Join-Path $PSScriptRoot 'logs' } else { Join-Path (Get-Location).Path 'logs' }),
+
+    # How to interpret the update source: Auto detects from the registry, or force
+    # Online/WSUS regardless of what the registry says. Forwarded to each step that
+    # supports -UpdateSource.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Auto', 'Online', 'WSUS')]
+    [string]$UpdateSource = 'Auto',
 
     # Forward a live online scan request to the local-client check.
     [Parameter(Mandatory = $false)]
@@ -141,6 +169,97 @@ function Add-IfSupported {
     }
 }
 
+# --- Canonical update-source detection (keep identical across all four scripts) ---
+# Determines whether this machine is managed by WSUS for OS updates and, independently,
+# what source Windows Defender uses for signature updates. Self-contained: does not call
+# any other helper in this script, so it can be copy-pasted verbatim into any of the four
+# WU-Troubleshooter scripts.
+function Get-WUUpdateSourceInfo {
+    [CmdletBinding()]
+    param(
+        # Manual override; default Auto resolves from the registry.
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Auto', 'Online', 'WSUS')]
+        [string]$Override = 'Auto'
+    )
+
+    $wuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    $defenderPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Signature Updates'
+
+    # UseWUServer is documented under \AU; fall back to the parent key since misplaced
+    # values do occur in the field.
+    $useWUServer = (Get-ItemProperty -Path $auPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    if ($null -eq $useWUServer) {
+        $useWUServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    }
+    $wuServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUServer' -ErrorAction SilentlyContinue).WUServer
+    $wuStatusServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUStatusServer' -ErrorAction SilentlyContinue).WUStatusServer
+
+    $wsusManaged = ($useWUServer -eq 1)
+
+    # Parse the WSUS URL, defaulting the port from the scheme when the URL omits it.
+    $wuServerScheme = $null
+    $wuServerHost   = $null
+    $wuServerPort   = $null
+    $wuServerValid  = $false
+    if ($wuServer) {
+        try {
+            $uri = [Uri]$wuServer
+            $wuServerScheme = $uri.Scheme
+            $wuServerHost   = $uri.Host
+            $wuServerPort   = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq 'https') { 443 } else { 80 }
+            $wuServerValid  = [bool]$wuServerHost
+        }
+        catch {
+            $wuServerValid = $false
+        }
+    }
+
+    # Defender's signature-update source is independent of the OS-update source above -
+    # a box can be WSUS-managed for OS updates but still fall back to MicrosoftUpdateServer
+    # for Defender definitions.
+    $fallbackRaw   = (Get-ItemProperty -Path $defenderPath -Name 'FallbackOrder' -ErrorAction SilentlyContinue).FallbackOrder
+    $fileSharesRaw = (Get-ItemProperty -Path $defenderPath -Name 'DefinitionUpdateFileSharesSources' -ErrorAction SilentlyContinue).DefinitionUpdateFileSharesSources
+    $defenderFallbackOrder = @()
+    if ($fallbackRaw) { $defenderFallbackOrder = @($fallbackRaw -split '\|' | Where-Object { $_ }) }
+    $defenderFileShares = @()
+    if ($fileSharesRaw) { $defenderFileShares = @($fileSharesRaw -split '\|' | Where-Object { $_ }) }
+    $defenderUsesMicrosoftUpdate = [bool]($defenderFallbackOrder | Where-Object { $_ -in 'MicrosoftUpdateServer', 'MMPC' })
+
+    # Resolve the effective source: an explicit override always wins over the registry.
+    $source = 'Registry'
+    if ($Override -eq 'Online') {
+        $resolvedSource = 'Online'; $source = 'Override'
+    }
+    elseif ($Override -eq 'WSUS') {
+        $resolvedSource = 'WSUS'; $source = 'Override'
+    }
+    else {
+        $resolvedSource = if ($wsusManaged) { 'WSUS' } else { 'Online' }
+    }
+
+    [pscustomobject]@{
+        UpdateSource                = $resolvedSource
+        Source                      = $source
+        WsusManaged                 = $wsusManaged
+        WUServer                    = $wuServer
+        WUStatusServer              = $wuStatusServer
+        WUServerScheme              = $wuServerScheme
+        WUServerHost                = $wuServerHost
+        WUServerPort                = $wuServerPort
+        WUServerValid               = $wuServerValid
+        DefenderFallbackOrder       = $defenderFallbackOrder
+        DefenderFileShares          = $defenderFileShares
+        DefenderUsesMicrosoftUpdate = $defenderUsesMicrosoftUpdate
+        Summary                     = ('UpdateSource={0} ({1}) | WSUS={2}{3} | DefenderUsesMU={4}' -f `
+                $resolvedSource, $source, $wsusManaged, `
+                $(if ($wsusManaged -and $wuServer) { " ($wuServer)" } else { '' }), `
+                $defenderUsesMicrosoftUpdate)
+    }
+}
+# --- End canonical update-source detection ---
+
 # -------------------------------------------------------------------------
 # Main logic
 # -------------------------------------------------------------------------
@@ -154,10 +273,14 @@ try {
         New-Item -Path $runFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
     }
 
+    # --- Update source detection (WSUS vs online, Auto or overridden) ------
+    $sourceInfo = Get-WUUpdateSourceInfo -Override $UpdateSource
+
     Write-Host ''
     Write-Host '=== Windows Update diagnostics (combined run) ===' -ForegroundColor Cyan
     Write-Host ("Host: {0}    Date: {1}" -f $env:COMPUTERNAME, (Get-Date)) -ForegroundColor Cyan
     Write-Host ("Run folder: {0}" -f $runFolder) -ForegroundColor Cyan
+    Write-Host ("Update source: {0}" -f $sourceInfo.Summary) -ForegroundColor Cyan
 
     $stepSummaries = New-Object System.Collections.Generic.List[object]
 
@@ -179,8 +302,11 @@ try {
             $stepLog = Join-Path $runFolder ('{0}.log' -f $step.Key)
             $splat = @{}
 
-            # Forward shared/optional parameters only if the script supports them.
+            # Forward shared/optional parameters only if the script supports them. The
+            # resolved source (never 'Auto') is forwarded so every step agrees, even one
+            # invoked with a registry read that would otherwise resolve differently.
             Add-IfSupported -Command $cmd -Splat $splat -Name 'LogPath' -Value $stepLog
+            Add-IfSupported -Command $cmd -Splat $splat -Name 'UpdateSource' -Value $sourceInfo.UpdateSource
             if ($RunLiveScan) { Add-IfSupported -Command $cmd -Splat $splat -Name 'RunLiveScan' -Value $true }
             if ($PerStepCsv)  { Add-IfSupported -Command $cmd -Splat $splat -Name 'CsvPath' -Value (Join-Path $runFolder ('{0}.csv' -f $step.Key)) }
 
@@ -244,6 +370,7 @@ try {
     $summaryText += ('Windows Update diagnostics - combined run')
     $summaryText += ('Host    : {0}' -f $env:COMPUTERNAME)
     $summaryText += ('Date    : {0}' -f (Get-Date))
+    $summaryText += ('Source  : {0}' -f $sourceInfo.Summary)
     $summaryText += ('Overall : {0}' -f $overall)
     $summaryText += ''
     $summaryText += ($stepSummaries | Format-Table Step, Status, Pass, Warn, Fail, Log -AutoSize | Out-String)

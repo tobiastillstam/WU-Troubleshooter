@@ -4,12 +4,20 @@
 <#
 .SYNOPSIS
     Health and troubleshooting check for the local Windows Update CLIENT on
-    Windows Server 2025 (online Windows Update, not on-prem WSUS).
+    Windows Server 2025 (online Windows Update or WSUS-managed).
 
 .DESCRIPTION
     Companion to Test-WUOnlineConnectivity.ps1. Where that script proves the
-    network path to Microsoft's update endpoints, this one inspects the local
-    update client that is supposed to use that path.
+    network path to Microsoft's update endpoints (or the configured WSUS server),
+    this one inspects the local update client that is supposed to use that path.
+
+    WSUS awareness: the Source module reads the WSUS/Defender policy keys (via the same
+    Get-WUUpdateSourceInfo detection block used by the other three scripts) to determine
+    whether this machine is WSUS-managed. Being WSUS-managed is a valid, intentional
+    configuration, not a defect - the WSUS policy check and the "block direct internet
+    access" check no longer WARN just because WSUS is in effect; they still WARN when the
+    configuration is actually broken (e.g. UseWUServer=1 with no usable WUServer). WSUS
+    *server*-side diagnostics (SUSDB, content store) remain out of scope for this script.
 
     Diagnostic modules (read-only):
       System    - OS build/UBR, last boot.
@@ -71,6 +79,13 @@
     Free-space threshold (GB) on the system drive below which a warning is raised.
     Default 10.
 
+.PARAMETER UpdateSource
+    How to interpret this machine's update source. Auto (default) detects it from the
+    WSUS/Defender policy registry keys. Online or WSUS forces the interpretation
+    regardless of what the registry says. Affects only the severity of two checks in the
+    Source module (WSUS policy, blocked internet access) - read-only; not
+    ShouldProcess-gated.
+
 .PARAMETER FixServices
     Remediation. Set required services to their expected start type and start the
     services that must be running. ShouldProcess-gated.
@@ -131,16 +146,30 @@
     Repairs the component store with DISM (ScanHealth + RestoreHealth) and then runs
     SFC /scannow, prompting before the change. Useful for 0x80070306 install failures.
 
+.EXAMPLE
+    .\Test-WULocalClient.ps1 -Category Source -UpdateSource WSUS
+    Shows the Source module with WSUS interpretation forced. On a machine that is actually
+    WSUS-managed, the WSUS policy and blocked-internet checks report PASS/INFO instead of
+    WARN. On a machine that is NOT WSUS-managed, forcing the interpretation instead WARNs
+    that the assumption does not match local policy, rather than silently reporting PASS.
+
 .NOTES
     Author        : Tobias Tillstam, Tillnet
     Webpage       : https://tillnet.se
     GitHub        : https://github.com/tobiastillstam
-    Version       : 1.0.0
+    Version       : 1.1.0
     Date Created  : 2026-06-17
-    Last Modified : 2026-06-20
+    Last Modified : 2026-08-19
 
     Change Log
     ----------
+    1.1.0 (2026-08-19) - Added WSUS awareness via the shared Get-WUUpdateSourceInfo
+                         detection block. The WSUS policy check and the blocked-internet-
+                         access check in the Source module no longer WARN when WSUS
+                         management is the intended configuration; WARN is retained only
+                         for a genuinely broken WSUS policy (UseWUServer=1 with a missing
+                         or unparseable WUServer). New -UpdateSource Auto|Online|WSUS
+                         parameter (default Auto).
     1.0.0 (2026-06-20) - First public release under the MIT license.
     0.3.0 (2026-06-18) - Added -RepairComponentStore remediation (DISM ScanHealth +
                          RestoreHealth, with optional -IncludeSfc for SFC /scannow),
@@ -152,7 +181,8 @@
 
     Operational notes:
     - Target: Windows Server 2025 (Windows PowerShell 5.1; also runs on PowerShell 7+).
-    - Scope: local online Windows Update client. On-prem WSUS is out of scope.
+    - Scope: the local update client, online or WSUS-managed. WSUS *server*-side
+      diagnostics (SUSDB, content store state) are out of scope.
     - Read-only by default; remediation is opt-in per switch and ShouldProcess-gated.
     - Companion to Test-WUOnlineConnectivity.ps1 (network path) and Get-WUErrors.ps1
       (deep WU error/ETL analysis).
@@ -186,6 +216,12 @@ param(
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 1000)]
     [int]$MinFreeGB = 10,
+
+    # How to interpret the update source: Auto detects from the registry, or force
+    # Online/WSUS regardless of what the registry says. Affects Source module severity only.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Auto', 'Online', 'WSUS')]
+    [string]$UpdateSource = 'Auto',
 
     # Remediation: fix service start types / start required services.
     [Parameter(Mandatory = $false)]
@@ -245,6 +281,97 @@ $ServiceBaseline = @(
 # -------------------------------------------------------------------------
 # Helper functions
 # -------------------------------------------------------------------------
+
+# --- Canonical update-source detection (keep identical across all four scripts) ---
+# Determines whether this machine is managed by WSUS for OS updates and, independently,
+# what source Windows Defender uses for signature updates. Self-contained: does not call
+# any other helper in this script, so it can be copy-pasted verbatim into any of the four
+# WU-Troubleshooter scripts.
+function Get-WUUpdateSourceInfo {
+    [CmdletBinding()]
+    param(
+        # Manual override; default Auto resolves from the registry.
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Auto', 'Online', 'WSUS')]
+        [string]$Override = 'Auto'
+    )
+
+    $wuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    $defenderPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Signature Updates'
+
+    # UseWUServer is documented under \AU; fall back to the parent key since misplaced
+    # values do occur in the field.
+    $useWUServer = (Get-ItemProperty -Path $auPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    if ($null -eq $useWUServer) {
+        $useWUServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    }
+    $wuServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUServer' -ErrorAction SilentlyContinue).WUServer
+    $wuStatusServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUStatusServer' -ErrorAction SilentlyContinue).WUStatusServer
+
+    $wsusManaged = ($useWUServer -eq 1)
+
+    # Parse the WSUS URL, defaulting the port from the scheme when the URL omits it.
+    $wuServerScheme = $null
+    $wuServerHost   = $null
+    $wuServerPort   = $null
+    $wuServerValid  = $false
+    if ($wuServer) {
+        try {
+            $uri = [Uri]$wuServer
+            $wuServerScheme = $uri.Scheme
+            $wuServerHost   = $uri.Host
+            $wuServerPort   = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq 'https') { 443 } else { 80 }
+            $wuServerValid  = [bool]$wuServerHost
+        }
+        catch {
+            $wuServerValid = $false
+        }
+    }
+
+    # Defender's signature-update source is independent of the OS-update source above -
+    # a box can be WSUS-managed for OS updates but still fall back to MicrosoftUpdateServer
+    # for Defender definitions.
+    $fallbackRaw   = (Get-ItemProperty -Path $defenderPath -Name 'FallbackOrder' -ErrorAction SilentlyContinue).FallbackOrder
+    $fileSharesRaw = (Get-ItemProperty -Path $defenderPath -Name 'DefinitionUpdateFileSharesSources' -ErrorAction SilentlyContinue).DefinitionUpdateFileSharesSources
+    $defenderFallbackOrder = @()
+    if ($fallbackRaw) { $defenderFallbackOrder = @($fallbackRaw -split '\|' | Where-Object { $_ }) }
+    $defenderFileShares = @()
+    if ($fileSharesRaw) { $defenderFileShares = @($fileSharesRaw -split '\|' | Where-Object { $_ }) }
+    $defenderUsesMicrosoftUpdate = [bool]($defenderFallbackOrder | Where-Object { $_ -in 'MicrosoftUpdateServer', 'MMPC' })
+
+    # Resolve the effective source: an explicit override always wins over the registry.
+    $source = 'Registry'
+    if ($Override -eq 'Online') {
+        $resolvedSource = 'Online'; $source = 'Override'
+    }
+    elseif ($Override -eq 'WSUS') {
+        $resolvedSource = 'WSUS'; $source = 'Override'
+    }
+    else {
+        $resolvedSource = if ($wsusManaged) { 'WSUS' } else { 'Online' }
+    }
+
+    [pscustomobject]@{
+        UpdateSource                = $resolvedSource
+        Source                      = $source
+        WsusManaged                 = $wsusManaged
+        WUServer                    = $wuServer
+        WUStatusServer              = $wuStatusServer
+        WUServerScheme              = $wuServerScheme
+        WUServerHost                = $wuServerHost
+        WUServerPort                = $wuServerPort
+        WUServerValid               = $wuServerValid
+        DefenderFallbackOrder       = $defenderFallbackOrder
+        DefenderFileShares          = $defenderFileShares
+        DefenderUsesMicrosoftUpdate = $defenderUsesMicrosoftUpdate
+        Summary                     = ('UpdateSource={0} ({1}) | WSUS={2}{3} | DefenderUsesMU={4}' -f `
+                $resolvedSource, $source, $wsusManaged, `
+                $(if ($wsusManaged -and $wuServer) { " ($wuServer)" } else { '' }), `
+                $defenderUsesMicrosoftUpdate)
+    }
+}
+# --- End canonical update-source detection ---
 
 function New-CheckResult {
     [CmdletBinding()]
@@ -399,19 +526,33 @@ function Get-WUProxyCheck {
 
 function Get-WUSourceCheck {
     [CmdletBinding()]
-    param()
+    param([Parameter(Mandatory)][pscustomobject]$SourceInfo)
 
     $wuPol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $auPol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
 
-    $useWUServer = Get-RegistryValue -Path $auPol -Name 'UseWUServer'
-    $wuServer    = Get-RegistryValue -Path $wuPol -Name 'WUServer'
-    $noInternet  = Get-RegistryValue -Path $wuPol -Name 'DoNotConnectToWindowsUpdateInternetLocations'
-    $disableAll  = Get-RegistryValue -Path $wuPol -Name 'DisableWindowsUpdateAccess'
+    $noInternet = Get-RegistryValue -Path $wuPol -Name 'DoNotConnectToWindowsUpdateInternetLocations'
+    $disableAll = Get-RegistryValue -Path $wuPol -Name 'DisableWindowsUpdateAccess'
 
-    if ($useWUServer -eq 1) {
+    # WSUS management is a valid, intentional configuration - only WARN when it is
+    # actually broken (UseWUServer=1 but no usable WUServer), not just because it is WSUS.
+    # $SourceInfo.WsusManaged is the raw UseWUServer registry fact; $assumeWsus additionally
+    # honors an explicit -UpdateSource WSUS override, so forcing the interpretation on a box
+    # where the registry does NOT show WSUS management surfaces that mismatch as a WARN
+    # rather than silently reporting PASS as though nothing were assumed.
+    $assumeWsus = ($SourceInfo.UpdateSource -eq 'WSUS')
+    if ($SourceInfo.WsusManaged) {
+        if ($SourceInfo.WUServerValid) {
+            New-CheckResult -Category 'Source' -Check 'WSUS policy' -Result 'PASS' `
+                -Detail ('UseWUServer=1 -> client targets WSUS ({0}); intentional WSUS management' -f $SourceInfo.WUServer)
+        }
+        else {
+            New-CheckResult -Category 'Source' -Check 'WSUS policy' -Result 'WARN' `
+                -Detail ('UseWUServer=1 but WUServer is missing or unparseable ({0}) -> broken WSUS configuration' -f ($(if ($SourceInfo.WUServer) { $SourceInfo.WUServer } else { 'no WUServer set' })))
+        }
+    }
+    elseif ($assumeWsus) {
         New-CheckResult -Category 'Source' -Check 'WSUS policy' -Result 'WARN' `
-            -Detail ('UseWUServer=1 -> client targets WSUS ({0}), not Windows Update online' -f ($(if ($wuServer) { $wuServer } else { 'no WUServer set' })))
+            -Detail '-UpdateSource WSUS was forced, but UseWUServer is not set in the registry - the assumed interpretation does not match local policy'
     }
     else {
         New-CheckResult -Category 'Source' -Check 'WSUS policy' -Result 'PASS' `
@@ -419,8 +560,14 @@ function Get-WUSourceCheck {
     }
 
     if ($noInternet -eq 1) {
-        New-CheckResult -Category 'Source' -Check 'Online access policy' -Result 'WARN' `
-            -Detail 'DoNotConnectToWindowsUpdateInternetLocations=1 -> online WU blocked by policy'
+        if ($SourceInfo.WsusManaged -or $assumeWsus) {
+            New-CheckResult -Category 'Source' -Check 'Online access policy' -Result 'INFO' `
+                -Detail 'DoNotConnectToWindowsUpdateInternetLocations=1 -> direct internet access blocked; expected under WSUS management'
+        }
+        else {
+            New-CheckResult -Category 'Source' -Check 'Online access policy' -Result 'WARN' `
+                -Detail 'DoNotConnectToWindowsUpdateInternetLocations=1 -> online WU blocked by policy'
+        }
     }
     if ($disableAll -eq 1) {
         New-CheckResult -Category 'Source' -Check 'WU access policy' -Result 'WARN' `
@@ -654,6 +801,9 @@ try {
     Write-Host ("Host: {0}    Date: {1}" -f $env:COMPUTERNAME, (Get-Date)) -ForegroundColor Cyan
     Write-Host ("Modules: {0}    LiveScan: {1}" -f ($Category -join ','), [bool]$RunLiveScan) -ForegroundColor Cyan
 
+    $sourceInfo = Get-WUUpdateSourceInfo -Override $UpdateSource
+    Write-Host ("Update source: {0}" -f $sourceInfo.Summary) -ForegroundColor Cyan
+
     $runAll  = $Category -contains 'All'
     $results = New-Object System.Collections.Generic.List[object]
 
@@ -661,7 +811,7 @@ try {
     if ($runAll -or $Category -contains 'System')    { Get-WUSystemInfo                                  | ForEach-Object { $results.Add($_) } }
     if ($runAll -or $Category -contains 'Services')   { Get-WUServiceCheck -Baseline $ServiceBaseline     | ForEach-Object { $results.Add($_) } }
     if ($runAll -or $Category -contains 'Proxy')      { Get-WUProxyCheck                                  | ForEach-Object { $results.Add($_) } }
-    if ($runAll -or $Category -contains 'Source')     { Get-WUSourceCheck                                 | ForEach-Object { $results.Add($_) } }
+    if ($runAll -or $Category -contains 'Source')     { Get-WUSourceCheck -SourceInfo $sourceInfo          | ForEach-Object { $results.Add($_) } }
     if ($runAll -or $Category -contains 'Blockers')   { Get-WUBlockerCheck -MinFreeGB $MinFreeGB          | ForEach-Object { $results.Add($_) } }
     if ($runAll -or $Category -contains 'Bits')       { Get-WUBitsCheck                                   | ForEach-Object { $results.Add($_) } }
     if ($runAll -or $Category -contains 'Datastore')  { Get-WUDatastoreCheck                              | ForEach-Object { $results.Add($_) } }

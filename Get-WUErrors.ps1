@@ -48,6 +48,15 @@
 .PARAMETER SeverityPattern
     Override the match regex entirely. When supplied, -IncludeText is ignored.
 
+.PARAMETER UpdateSource
+    How to interpret this machine's update source. Auto (default) detects it from the
+    WSUS/Defender policy registry keys. Online or WSUS forces the interpretation
+    regardless of what the registry says. Affects only the known-issue hint text: a
+    handful of codes (0x8024500C, 0x80244022, 0x8024401C, 0x80244019, 0x80246007) get
+    WSUS-server-side guidance instead of client-network guidance when WSUS-managed, since
+    Microsoft Update being unreachable is expected in that mode. Read-only; not
+    ShouldProcess-gated.
+
 .PARAMETER PassThru
     Emit one object per matched line instead of a single summary object.
 
@@ -104,16 +113,27 @@
     .\Get-WUErrors.ps1 -CsvPath 'C:\Temp\wu-errors.csv'
     Export the matched lines to CSV (folder created if needed).
 
+.EXAMPLE
+    .\Get-WUErrors.ps1 -UpdateSource WSUS
+    Scans as usual, but known-issue hints for WSUS-affected codes (e.g. 0x8024500C) lead
+    with WSUS-side causes (content sync, WsusPool health) instead of client connectivity.
+
 .NOTES
     Author        : Tobias Tillstam, Tillnet
     Webpage       : https://tillnet.se
     GitHub        : https://github.com/tobiastillstam
-    Version       : 1.0.0
+    Version       : 1.1.0
     Date Created  : 2026-06-08
-    Last Modified : 2026-06-20
+    Last Modified : 2026-08-19
 
     Change Log
     ----------
+    1.1.0 (2026-08-19) - Added WSUS awareness: known-issue hints for 0x8024500C,
+                         0x80244022, 0x8024401C, 0x80244019 and 0x80246007 now lead with
+                         WSUS-server-side causes when the shared Get-WUUpdateSourceInfo
+                         detection block finds this machine is WSUS-managed, since MU being
+                         unreachable is expected in that mode. New -UpdateSource
+                         Auto|Online|WSUS parameter (default Auto).
     1.0.0 (2026-06-20) - First public release under the MIT license.
     0.5.0 (2026-06-18) - Added -ScanCbsCorruption mode: scans the CBS log for component-
                          store corruption and groups the flagged manifests by language tag
@@ -174,6 +194,12 @@ param(
     # Full override of the match regex.
     [Parameter(Mandatory = $false)]
     [string]$SeverityPattern,
+
+    # How to interpret the update source: Auto detects from the registry, or force
+    # Online/WSUS regardless of what the registry says. Affects known-issue hint text only.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Auto', 'Online', 'WSUS')]
+    [string]$UpdateSource = 'Auto',
 
     # Emit one object per matched line instead of a summary object.
     [Parameter(Mandatory = $false)]
@@ -258,6 +284,7 @@ $KnownCodes = @{
     '0x80070306' = 'Win32 install error 0x0306 (update install failed)'
     '0x80073712' = 'ERROR_SXS_COMPONENT_STORE_CORRUPT (servicing)'
     '0x800f0922' = 'CBS install failure'
+    '0x8024500c' = 'WU_E_REDIRECTOR_ID_SMALLER (redirector / service metadata)'
 }
 
 # Codes commonly tied to Microsoft-acknowledged CU install issues rather than local
@@ -270,9 +297,113 @@ $KnownIssueHints = @{
     '0x800f0922' = 'CBS install failure - if it recurs on a specific CU, check release health for a known issue'
 }
 
+# WSUS-mode hints for codes that, in an online client, would normally point at client
+# network/firewall causes - but when this machine is WSUS-managed, Microsoft Update being
+# unreachable is expected, so these lead with WSUS-server-side causes instead. Overlaid on
+# top of $KnownIssueHints (not merged in) when Get-WUUpdateSourceInfo resolves to WSUS, so
+# WSUS-mode text replaces the online-mode text for the same code rather than adding to it.
+$WsusIssueHints = @{
+    '0x8024500c' = 'check WSUS content sync status on the server - approved in the console does not mean the content file finished downloading to WsusContent'
+    '0x80244022' = 'WSUS server-side: IIS site / WsusPool app pool likely down or recycling - check IIS on the WSUS server, not client connectivity'
+    '0x8024401c' = 'WSUS server timeout - check WsusPool health and SUSDB load on the WSUS server'
+    '0x80244019' = 'HTTP 404 from WSUS - content approved in the console but missing from WsusContent on the server'
+    '0x80246007' = 'not downloaded - content approved but absent on the WSUS server, not a client download failure'
+}
+
 # -------------------------------------------------------------------------
 # Helper functions
 # -------------------------------------------------------------------------
+
+# --- Canonical update-source detection (keep identical across all four scripts) ---
+# Determines whether this machine is managed by WSUS for OS updates and, independently,
+# what source Windows Defender uses for signature updates. Self-contained: does not call
+# any other helper in this script, so it can be copy-pasted verbatim into any of the four
+# WU-Troubleshooter scripts.
+function Get-WUUpdateSourceInfo {
+    [CmdletBinding()]
+    param(
+        # Manual override; default Auto resolves from the registry.
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Auto', 'Online', 'WSUS')]
+        [string]$Override = 'Auto'
+    )
+
+    $wuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $auPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    $defenderPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Signature Updates'
+
+    # UseWUServer is documented under \AU; fall back to the parent key since misplaced
+    # values do occur in the field.
+    $useWUServer = (Get-ItemProperty -Path $auPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    if ($null -eq $useWUServer) {
+        $useWUServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'UseWUServer' -ErrorAction SilentlyContinue).UseWUServer
+    }
+    $wuServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUServer' -ErrorAction SilentlyContinue).WUServer
+    $wuStatusServer = (Get-ItemProperty -Path $wuPolicyPath -Name 'WUStatusServer' -ErrorAction SilentlyContinue).WUStatusServer
+
+    $wsusManaged = ($useWUServer -eq 1)
+
+    # Parse the WSUS URL, defaulting the port from the scheme when the URL omits it.
+    $wuServerScheme = $null
+    $wuServerHost   = $null
+    $wuServerPort   = $null
+    $wuServerValid  = $false
+    if ($wuServer) {
+        try {
+            $uri = [Uri]$wuServer
+            $wuServerScheme = $uri.Scheme
+            $wuServerHost   = $uri.Host
+            $wuServerPort   = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq 'https') { 443 } else { 80 }
+            $wuServerValid  = [bool]$wuServerHost
+        }
+        catch {
+            $wuServerValid = $false
+        }
+    }
+
+    # Defender's signature-update source is independent of the OS-update source above -
+    # a box can be WSUS-managed for OS updates but still fall back to MicrosoftUpdateServer
+    # for Defender definitions.
+    $fallbackRaw   = (Get-ItemProperty -Path $defenderPath -Name 'FallbackOrder' -ErrorAction SilentlyContinue).FallbackOrder
+    $fileSharesRaw = (Get-ItemProperty -Path $defenderPath -Name 'DefinitionUpdateFileSharesSources' -ErrorAction SilentlyContinue).DefinitionUpdateFileSharesSources
+    $defenderFallbackOrder = @()
+    if ($fallbackRaw) { $defenderFallbackOrder = @($fallbackRaw -split '\|' | Where-Object { $_ }) }
+    $defenderFileShares = @()
+    if ($fileSharesRaw) { $defenderFileShares = @($fileSharesRaw -split '\|' | Where-Object { $_ }) }
+    $defenderUsesMicrosoftUpdate = [bool]($defenderFallbackOrder | Where-Object { $_ -in 'MicrosoftUpdateServer', 'MMPC' })
+
+    # Resolve the effective source: an explicit override always wins over the registry.
+    $source = 'Registry'
+    if ($Override -eq 'Online') {
+        $resolvedSource = 'Online'; $source = 'Override'
+    }
+    elseif ($Override -eq 'WSUS') {
+        $resolvedSource = 'WSUS'; $source = 'Override'
+    }
+    else {
+        $resolvedSource = if ($wsusManaged) { 'WSUS' } else { 'Online' }
+    }
+
+    [pscustomobject]@{
+        UpdateSource                = $resolvedSource
+        Source                      = $source
+        WsusManaged                 = $wsusManaged
+        WUServer                    = $wuServer
+        WUStatusServer              = $wuStatusServer
+        WUServerScheme              = $wuServerScheme
+        WUServerHost                = $wuServerHost
+        WUServerPort                = $wuServerPort
+        WUServerValid               = $wuServerValid
+        DefenderFallbackOrder       = $defenderFallbackOrder
+        DefenderFileShares          = $defenderFileShares
+        DefenderUsesMicrosoftUpdate = $defenderUsesMicrosoftUpdate
+        Summary                     = ('UpdateSource={0} ({1}) | WSUS={2}{3} | DefenderUsesMU={4}' -f `
+                $resolvedSource, $source, $wsusManaged, `
+                $(if ($wsusManaged -and $wuServer) { " ($wuServer)" } else { '' }), `
+                $defenderUsesMicrosoftUpdate)
+    }
+}
+# --- End canonical update-source detection ---
 
 function Confirm-ParentDirectory {
     <#
@@ -415,6 +546,10 @@ try {
         return
     }
 
+    # --- Update source detection (affects known-issue hint text only) ------
+    $sourceInfo = Get-WUUpdateSourceInfo -Override $UpdateSource
+    Write-Host ("Update source: {0}" -f $sourceInfo.Summary) -ForegroundColor Cyan
+
     # --- Convert ETL to a readable log -------------------------------------
     Write-Host ("Converting ETL files to {0} (this can take 30-60s)..." -f $ConvertedLogPath) -ForegroundColor Cyan
     Confirm-ParentDirectory -FilePath $ConvertedLogPath
@@ -535,13 +670,19 @@ try {
             Write-Host ('  {0}  x{1,-4} {2}' -f $g.Name, $g.Count, $meaning) -ForegroundColor Gray
         }
 
-        # Known-issue hints for codes commonly tied to Microsoft CU bugs.
-        $hintCodes = @($byCode.Name | Where-Object { $KnownIssueHints.ContainsKey($_) })
+        # Known-issue hints for codes commonly tied to Microsoft CU bugs. In WSUS mode,
+        # $WsusIssueHints overlays (replaces, per-code) the online-mode text, since MU
+        # being unreachable is expected there and the online hint would misdirect.
+        $effectiveHints = $KnownIssueHints.Clone()
+        if ($sourceInfo.UpdateSource -eq 'WSUS') {
+            foreach ($key in $WsusIssueHints.Keys) { $effectiveHints[$key] = $WsusIssueHints[$key] }
+        }
+        $hintCodes = @($byCode.Name | Where-Object { $effectiveHints.ContainsKey($_) })
         if ($hintCodes) {
             Write-Host ''
-            Write-Host 'Known-issue hints:' -ForegroundColor Yellow
+            Write-Host ('Known-issue hints ({0} mode):' -f $sourceInfo.UpdateSource) -ForegroundColor Yellow
             foreach ($code in $hintCodes) {
-                Write-Host ('  {0}: {1}' -f $code, $KnownIssueHints[$code]) -ForegroundColor Yellow
+                Write-Host ('  {0}: {1}' -f $code, $effectiveHints[$code]) -ForegroundColor Yellow
             }
             Write-Host ('  Release health: {0}' -f $ReleaseHealthUrl) -ForegroundColor DarkGray
         }
