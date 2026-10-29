@@ -1,13 +1,9 @@
 # Windows Update Troubleshooting Toolset
 
-Global conventions (PowerShell template, working style) live in
-~/.claude/CLAUDE.md. This file is only what's specific to this project.
-
 Target:  Windows Server 2025, Windows Update client-side (online and/or WSUS-managed).
          WSUS *server*-side diagnostics (SUSDB, content store) are a separate, later task -
          out of scope here.
-Status:  v1.1.0, production-tested, released (tagged v1.0.0 and v1.1.0 on GitHub).
-Package: WU-Troubleshooting-Toolset.zip
+Version: 1.1.0
 
 ## Scripts
 
@@ -22,17 +18,17 @@ Package: WU-Troubleshooting-Toolset.zip
 All four scripts carry an identical, self-contained `Get-WUUpdateSourceInfo` function
 (reads `WUServer`/`UseWUServer` and the Defender `FallbackOrder` policy keys) and an
 `-UpdateSource Auto|Online|WSUS` parameter (default Auto = registry-detected). It is
-**duplicated verbatim** in each script, not shared via a module - see "Clipboard-paste
-constraint" below. When editing it, copy the change into all four scripts identically;
+**duplicated verbatim** in each script, not shared via a module - see "Self-contained
+scripts" below. When editing it, copy the change into all four scripts identically;
 don't let them drift. A WSUS-managed box must report clean PASS/INFO, never a false-
 positive FAIL/WARN, for the Microsoft endpoints it deliberately doesn't reach.
 
-## Clipboard-paste constraint (don't relearn this)
+## Self-contained scripts
 
-These scripts are sometimes deployed to locked-down servers by clipboard-paste, no file
-transfer. Every script must stay independently paste-able: no dot-sourcing, no shared
-module, no cross-script runtime dependency. Any logic needed in more than one script
-(currently just `Get-WUUpdateSourceInfo`) is duplicated verbatim rather than factored out.
+Every script must stay self-contained and runnable on its own: no dot-sourcing, no
+shared module, no cross-script runtime dependency. Any logic needed in more than one
+script (currently just `Get-WUUpdateSourceInfo`) is duplicated verbatim rather than
+factored out.
 
 ## Get-WUErrors.ps1 (the distinctive one)
 
